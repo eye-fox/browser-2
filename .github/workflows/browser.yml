@@ -26,16 +26,40 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install Chromium
+      - name: Install Chromium + deps
         run: |
+          set -x
+          # Install Chromium via snap (most reliable on ubuntu-latest)
           sudo apt-get update -qq
           sudo apt-get install -y -qq chromium-browser 2>/dev/null || sudo apt-get install -y -qq chromium 2>/dev/null || true
-          CHROME=$(which google-chrome google-chrome-stable chromium chromium-browser 2>/dev/null | head -1)
-          if [ -z "$CHROME" ]; then sudo snap install chromium 2>/dev/null || true; CHROME=$(which chromium 2>/dev/null); fi
-          if [ -n "$CHROME" ] && [ "$CHROME" != "/usr/bin/chromium" ]; then sudo ln -sf "$CHROME" /usr/bin/chromium; fi
-          echo "BROWSER=$CHROME"
+          
+          # Find any Chrome/Chromium
+          for B in google-chrome google-chrome-stable chromium chromium-browser; do
+            P=$(which $B 2>/dev/null || true)
+            if [ -n "$P" ]; then
+              echo "FOUND: $P"
+              if [ "$P" != "/usr/bin/chromium" ]; then
+                sudo ln -sf "$P" /usr/bin/chromium
+              fi
+              echo "CHROMIUM=$P" >> $GITHUB_ENV
+              break
+            fi
+          done
+          
+          # Fallback: download Chrome directly
+          if [ ! -f /usr/bin/chromium ]; then
+            echo "Downloading Chrome..."
+            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+            sudo apt-get install -y -qq /tmp/chrome.deb 2>/dev/null || sudo dpkg -i /tmp/chrome.deb 2>/dev/null || true
+            P=$(which google-chrome-stable 2>/dev/null || echo "")
+            if [ -n "$P" ]; then
+              sudo ln -sf "$P" /usr/bin/chromium
+            fi
+          fi
+          
+          ls -la /usr/bin/chromium 2>/dev/null || echo "NO CHROMIUM"
 
-      - name: Install deps
+      - name: Install Python deps
         run: pip install -q websocket-client
 
       - name: Restore cache
@@ -46,26 +70,50 @@ jobs:
 
       - name: Run command
         run: |
+          set -x
           chmod +x $GITHUB_WORKSPACE/browser-local
-          CMD=$(echo "${{ github.event.inputs.cmd_b64 }}" | base64 -d)
+          CMD=$(echo "${{ github.event.inputs.cmd_b64 }}" | base64 -d 2>/dev/null)
           SES=${{ github.event.inputs.session }}
+          echo "CMD=[$CMD] SES=[$SES]"
 
           # Start browser
           python3 $GITHUB_WORKSPACE/browser-local --session "$SES" start --port=9222 &
           SPID=$!
 
-          # Wait for CDP
+          # Wait for CDP URL
+          CDP=""
           for i in $(seq 1 15); do
-            CDP=$(python3 -c "import json; f='/tmp/browser-local.pid'; print(json.load(open(f))['cdp_url'])" 2>/dev/null)
-            [ -n "$CDP" ] && break
-            CDP=$(python3 -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/version').read()).get('webSocketDebuggerUrl',''))" 2>/dev/null)
+            if [ -f /tmp/browser-local.pid ]; then
+              CDP=$(python3 -c "import json; print(json.load(open('/tmp/browser-local.pid'))['cdp_url'])" 2>/dev/null)
+            fi
+            if [ -z "$CDP" ]; then
+              CDP=$(python3 -c "
+import json, urllib.request
+try:
+    d = json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/version').read())
+    print(d.get('webSocketDebuggerUrl',''))
+except Exception as e:
+    pass
+" 2>/dev/null)
+            fi
             [ -n "$CDP" ] && break
             sleep 2
           done
 
-          if [ -z "$CDP" ]; then echo "FAIL: no CDP"; exit 1; fi
+          if [ -z "$CDP" ]; then
+            echo "FAIL: no CDP URL found"
+            kill $SPID 2>/dev/null || true
+            exit 1
+          fi
+          echo "CDP=$CDP"
+
+          # Run the command
           python3 $GITHUB_WORKSPACE/browser-local --cdp-url "$CDP" --session "$SES" $CMD 2>&1 || true
-          kill $SPID 2>/dev/null; pkill -f remote-debugging 2>/dev/null
+
+          # Cleanup
+          kill $SPID 2>/dev/null || true
+          pkill -f remote-debugging 2>/dev/null || true
+          echo "DONE"
 
       - name: Save cache
         if: always()
