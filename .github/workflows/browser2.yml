@@ -16,7 +16,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: |
+      - name: Setup
+        run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq chromium-browser 2>/dev/null || sudo apt-get install -y -qq chromium 2>/dev/null || true
           for B in google-chrome google-chrome-stable chromium chromium-browser; do
@@ -31,7 +32,8 @@ jobs:
         with:
           path: /tmp/browser-local-data
           key: browser-profile-${{ inputs.session }}
-      - run: |
+      - name: Exec
+        run: |
           set +e
           chmod +x browser-local
           CMD=$(echo "${{ inputs.cmd_b64 }}" | base64 -d)
@@ -45,12 +47,21 @@ jobs:
             [ -n "$CDP" ] && break
             sleep 2
           done
-          if [ -z "$CDP" ]; then echo "FAIL: CDP not found"; exit 1; fi
-          python3 browser-local --cdp-url "$CDP" --session "${{ inputs.session }}" $CMD 2>&1 || true
+          if [ -z "$CDP" ]; then echo "CDP_ERROR"; exit 1; fi
+          python3 browser-local --cdp-url "$CDP" --session "${{ inputs.session }}" $CMD 2>&1
+          RC=$?
           kill $SPID 2>/dev/null || true
           pkill -f remote-debugging 2>/dev/null || true
+          exit $RC
       - if: always()
         uses: actions/cache/save@v4
         with:
           path: /tmp/browser-local-data
           key: browser-profile-${{ inputs.session }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ inputs.session }}
+          path: /tmp/browser-local-screenshot.png
+          retention-days: 1
+          if-no-files-found: ignore
