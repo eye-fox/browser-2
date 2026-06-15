@@ -3,29 +3,20 @@ on:
   workflow_dispatch:
     inputs:
       cmd_b64:
-        description: Base64-encoded browser-local command
+        type: string
         required: true
-        type: string
       session:
-        description: Session name for profile cache
-        default: default
         type: string
-
-concurrency:
-  group: browser-session-${{ github.event.inputs.session }}
-  cancel-in-progress: true
-
+        default: default
 jobs:
-  execute:
+  exec:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Install Chromium
-        run: |
+      - run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq chromium-browser 2>/dev/null || sudo apt-get install -y -qq chromium 2>/dev/null || true
           for B in google-chrome google-chrome-stable chromium chromium-browser; do
@@ -35,36 +26,31 @@ jobs:
               break
             fi
           done
-          [ -f /usr/bin/chromium ] || echo "NO_CHROMIUM"
-      - name: Install deps
-        run: pip install -q websocket-client
-      - name: Restore cache
-        uses: actions/cache@v4
+          pip install -q websocket-client
+      - uses: actions/cache@v4
         with:
           path: /tmp/browser-local-data
-          key: browser-profile-${{ github.event.inputs.session }}
-      - name: Run
-        run: |
-          chmod +x $GITHUB_WORKSPACE/browser-local
-          CMD=$(echo "${{ github.event.inputs.cmd_b64 }}" | base64 -d)
-          SES=${{ github.event.inputs.session }}
-          python3 $GITHUB_WORKSPACE/browser-local --session "$SES" start --port=9222 &
+          key: browser-profile-${{ inputs.session }}
+      - run: |
+          set +e
+          chmod +x browser-local
+          CMD=$(echo "${{ inputs.cmd_b64 }}" | base64 -d)
+          python3 browser-local --session "${{ inputs.session }}" start --port=9222 &
           SPID=$!
           CDP=""
-          for i in $(seq 1 15); do
-            CDP=$(python3 -c "import json,os; f='/tmp/browser-local.pid'; print(json.load(open(f))['cdp_url'])" 2>/dev/null)
+          for i in $(seq 1 20); do
+            CDP=$(python3 -c "import json; print(json.load(open('/tmp/browser-local.pid'))['cdp_url'])" 2>/dev/null || echo "")
             [ -n "$CDP" ] && break
-            CDP=$(python3 -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/version').read()).get('webSocketDebuggerUrl',''))" 2>/dev/null)
+            CDP=$(python3 -c "import json,urllib.request; print(json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/version').read()).get('webSocketDebuggerUrl',''))" 2>/dev/null || echo "")
             [ -n "$CDP" ] && break
             sleep 2
           done
-          [ -z "$CDP" ] && echo "FAIL:no CDP" && kill $SPID 2>/dev/null && exit 1
-          python3 $GITHUB_WORKSPACE/browser-local --cdp-url "$CDP" --session "$SES" $CMD 2>&1 || true
+          if [ -z "$CDP" ]; then echo "FAIL: CDP not found"; exit 1; fi
+          python3 browser-local --cdp-url "$CDP" --session "${{ inputs.session }}" $CMD 2>&1 || true
           kill $SPID 2>/dev/null || true
           pkill -f remote-debugging 2>/dev/null || true
-      - name: Save cache
-        if: always()
+      - if: always()
         uses: actions/cache/save@v4
         with:
           path: /tmp/browser-local-data
-          key: browser-profile-${{ github.event.inputs.session }}
+          key: browser-profile-${{ inputs.session }}
