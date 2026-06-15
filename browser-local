@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""browser-local — Chromium via CDP, 100% browser-use CLI compatible, no cloud"""
+import argparse, subprocess, sys, os, json, time, signal, re, shutil, urllib.request, base64, shlex, random
+from websocket import create_connection
+
+BROWSER = "/usr/bin/chromium"
+BVER = "147"
+PID_FILE = "/tmp/browser-local.pid"
+SESS_FILE = "/tmp/browser-local-sessions.json"
+DATA_DIR = "/tmp/browser-local-data"
+HUMAN_MODE = False
+FP = {}
+
+_COMMON_SIZES = [
+    (1920,1080), (1366,768), (1536,864), (1440,900),
+    (1280,720), (1600,900), (2560,1440), (1280,800)
+]
+_WEBGL_VENDORS = [
+    ("Google Inc. (Intel)","ANGLE (Intel, Intel(R) Arc(TM) A770 Graphics (0x000056A0) Direct3D11 vs_5_0 ps_5_0)"),
+    ("Google Inc. (Intel)","ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0)"),
+    ("Google Inc. (Intel)","ANGLE (Intel, Intel(R) Iris Xe Graphics (0x00009A49) Direct3D11 vs_5_0 ps_5_0)"),
+    ("Google Inc. (NVIDIA)","ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002484) Direct3D11 vs_5_0 ps_5_0)"),
+    ("Google Inc. (NVIDIA)","ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 (0x00002786) Direct3D11 vs_5_0 ps_5_0)"),
+    ("Google Inc. (AMD)","ANGLE (AMD, AMD Radeon RX 6800 XT (0x000073BF) Direct3D11 vs_5_0 ps_5_0)"),
+]
+
+def _rand_fp(w=0, h=0, tz=None, locale=None):
+    fp = {}
+    if w and h:
+        fp['w'], fp['h'] = w, h
+    else:
+        fp['w'], fp['h'] = random.choice(_COMMON_SIZES)
+    fp['sat'] = random.randint(20, 40)
+    fp['sal'] = random.randint(0, 5)
+    fp['sah'] = fp['h'] - fp['sat'] - random.randint(10, 30)
+    fp['saw'] = fp['w'] - fp['sal'] * 2
+    fp['hc'] = random.choice([4, 8, 12, 16])
+    fp['dm'] = random.choice([4, 8])
+    fp['mtp'] = random.choice([0, 1])
+    fp['cd'] = random.choice([24, 30, 48])
+    fp['ect'] = random.choice(['4g', '3g', 'wifi'])
+    fp['dl'] = random.randint(5, 50)
+    fp['dlmax'] = random.randint(50, 200)
+    fp['rtt'] = random.randint(20, 150)
+    fp['gpu_vendor'], fp['gpu_renderer'] = random.choice(_WEBGL_VENDORS)
+    fp['tz'] = tz or random.choice([
+        'America/New_York','America/Chicago','America/Denver','America/Los_Angeles',
+        'Europe/London','Europe/Berlin','Europe/Paris','Asia/Tokyo',
+        'Asia/Shanghai','Asia/Jakarta','Asia/Singapore','Australia/Sydney'
+    ])
+    fp['locale'] = locale or random.choice([
+        'en-US','en-GB','id-ID','de-DE','fr-FR','ja-JP','zh-CN','en-AU','ko-KR'
+    ])
+    fp['platform'] = 'Linux x86_64'
+    fp['arch'] = 'x86'
+    fp['osver'] = '6.8.0'
+    _lang_map = {
+        'en-US': ['en-US','en'], 'en-GB': ['en-GB','en'], 'id-ID': ['id-ID','id','en'],
+        'de-DE': ['de-DE','de','en'], 'fr-FR': ['fr-FR','fr','en'], 'ja-JP': ['ja-JP','ja','en'],
+        'zh-CN': ['zh-CN','zh','en'], 'en-AU': ['en-AU','en'], 'ko-KR': ['ko-KR','ko','en'],
+    }
+    fp['langs'] = json.dumps(_lang_map.get(fp['locale'], ['en-US','en']))
+    fp['w'] = max(fp['w'], 800)
+    fp['h'] = max(fp['h'], 600)
+    return fp
+
+def gen_stealth_js(**kw):
+    fp = _rand_fp(**kw)
+    FP.update(fp)
+    UA = f'Mozilla/5.0 (X11; Linux {fp["arch"]}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{BVER}.0.0.0 Safari/537.36'
+    return fr"""
+try{{if(Navigator.prototype.hasOwnProperty('webdriver'))delete Navigator.prototype.webdriver;Object.defineProperty(navigator,'webdriver',{{get:()=>undefined,configurable:true}})}}catch(e){{}}
+try{{const _p=Object.create(PluginArray.prototype);const _d=[{{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',description:'Portable Document Format'}},{{name:'Chrome PDF Viewer',filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai',description:''}},{{name:'Native Client',filename:'internal-nacl-plugin',description:''}}];Object.defineProperties(_p,{{0:{{value:_d[0],writable:true}},1:{{value:_d[1],writable:true}},2:{{value:_d[2],writable:true}},length:{{value:3,writable:false}},item:{{value:i=>_p[i]||null}},namedItem:{{value:n=>{{for(let i=0;i<3;i++)if(_p[i].name===n)return _p[i];return null}}}},refresh:{{value:()=>{{}}}}}});Object.defineProperty(navigator,'plugins',{{get:()=>_p,configurable:true}})}}catch(e){{}}
+Object.defineProperty(navigator,'languages',{{get:()=>{fp['langs']}}})
+Object.defineProperty(navigator,'hardwareConcurrency',{{get:()=>{fp['hc']}}})
+Object.defineProperty(navigator,'deviceMemory',{{get:()=>{fp['dm']}}})
+Object.defineProperty(navigator,'maxTouchPoints',{{get:()=>{fp['mtp']}}})
+Object.defineProperty(navigator,'platform',{{get:()=>'{fp["platform"]}',configurable:true}})
+Object.defineProperty(navigator,'pdfViewerEnabled',{{get:()=>true,configurable:true}})
+Object.defineProperty(navigator,'cookieEnabled',{{get:()=>true,configurable:true}})
+try{{if(!window.chrome)window.chrome={{}};if(!chrome.runtime)chrome.runtime={{id:'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',connect:()=>({{onMessage:{{addListener:()=>{{}}}},onDisconnect:{{addListener:()=>{{}}}}}}),sendMessage:(m,c)=>{{if(c)c()}},getManifest:()=>({{version:'{BVER}.0.0.0'}}),onMessage:{{addListener:()=>{{}}}},onConnect:{{addListener:()=>{{}}}},onStartup:{{addListener:()=>{{}}}}}};if(!chrome.loadTimes)chrome.loadTimes=function(){{return{{}}}};if(!chrome.csi)chrome.csi=function(){{return{{}}}};if(!chrome.app)chrome.app={{isInstalled:false}};if(!chrome.webstore)chrome.webstore={{}}}}catch(e){{}}
+try{{if(navigator.permissions&&navigator.permissions.query){{const _q=navigator.permissions.query.bind(navigator.permissions);navigator.permissions.query=(p)=>{{if(p&&['notifications','clipboard-read','clipboard-write'].includes(p.name))return Promise.resolve({{state:'prompt',onchange:null}});return _q(p)}}}}}}catch(e){{}}
+try{{const _gc=HTMLCanvasElement.prototype.getContext;HTMLCanvasElement.prototype.getContext=function(...a){{const c=_gc.apply(this,a);if(c&&(a[0]==='webgl'||a[0]==='webgl2')){{const gp=c.getParameter.bind(c);c.getParameter=function(p){{if(p===37445)return'{fp["gpu_vendor"]}';if(p===37446)return'{fp["gpu_renderer"]}';return gp(p)}}}}return c}}}}catch(e){{}}
+try{{document.documentElement.removeAttribute('webdriver')}}catch(e){{}}
+try{{const _uad={{brands:[{{brand:'Chromium',version:'{BVER}'}},{{brand:'Google Chrome',version:'{BVER}'}},{{brand:'Not?A_Brand',version:'99'}}],mobile:false,platform:'Linux',getHighEntropyValues:function(h){{return Promise.resolve({{architecture:'{fp["arch"]}',model:'',platform:'Linux',platformVersion:'{fp["osver"]}',uaFullType:'{UA}',fullVersionList:[{{brand:'Chromium',version:'{BVER}'}},{{brand:'Google Chrome',version:'{BVER}'}},{{brand:'Not?A_Brand',version:'99'}}],wow64:false}})}},toJSON:function(){{return{{brands:this.brands,mobile:this.mobile,platform:this.platform}}}}}};Object.defineProperty(navigator,'userAgentData',{{get:()=>_uad,configurable:true}})}}catch(e){{}}
+try{{Object.defineProperty(window,'outerWidth',{{get:()=>{fp['w']},configurable:true}});Object.defineProperty(window,'outerHeight',{{get:()=>{fp['h']},configurable:true}});Object.defineProperty(window,'screenX',{{get:()=>{fp['sal']},configurable:true}});Object.defineProperty(window,'screenY',{{get:()=>{fp['sat']},configurable:true}})}}catch(e){{}}
+try{{Object.defineProperty(screen,'availWidth',{{get:()=>{fp['saw']},configurable:true}});Object.defineProperty(screen,'availHeight',{{get:()=>{fp['sah']},configurable:true}});Object.defineProperty(screen,'availTop',{{get:()=>{fp['sat']},configurable:true}});Object.defineProperty(screen,'availLeft',{{get:()=>{fp['sal']},configurable:true}});Object.defineProperty(screen,'colorDepth',{{get:()=>{fp['cd']},configurable:true}});Object.defineProperty(screen,'pixelDepth',{{get:()=>{fp['cd']},configurable:true}})}}catch(e){{}}
+try{{Object.defineProperty(document,'hidden',{{get:()=>false,configurable:true}});Object.defineProperty(document,'visibilityState',{{get:()=>'visible',configurable:true}})}}catch(e){{}}
+try{{if(!performance.memory)Object.defineProperty(performance,'memory',{{get:()=>({{jsHeapSizeLimit:4294705152,totalJSHeapSize:{random.randint(8000000,30000000)},usedJSHeapSize:{random.randint(5000000,15000000)}}}),configurable:true}})}}catch(e){{}}
+try{{const _c={{effectiveType:'{fp["ect"]}',downlink:{fp["dl"]},downlinkMax:{fp["dlmax"]},rtt:{fp["rtt"]},saveData:false,type:'cellular' if '{fp["ect"]}'=='3g' or '{fp["ect"]}'=='4g' else 'wifi',onchange:null,addEventListener:function(){{}},removeEventListener:function(){{}}}};Object.defineProperty(navigator,'connection',{{get:()=>_c,configurable:true}})}}catch(e){{}}
+try{{const _OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;if(_OAC){{const _sr=_OAC.prototype.startRendering;_OAC.prototype.startRendering=function(){{const r=_sr.call(this);if(r&&typeof r.then==='function')return r.then(function(b){{for(let c=0;c<b.numberOfChannels;c++){{const d=b.getChannelData(c);for(let i=0;i<d.length;i+=100)d[i]+=0.000001}}return b}});return r}}}}Object.defineProperty(navigator,'bluetooth',{{get:()=>({{getAvailability:()=>Promise.resolve(false),requestDevice:()=>Promise.reject(new DOMException('User cancelled','NotFoundError')),addEventListener:function(){{}},removeEventListener:function(){{}},referringDevice:null}}),configurable:true}})}}catch(e){{}}
+try{{Object.defineProperty(navigator,'credentials',{{get:()=>({{get:()=>Promise.resolve(null),store:()=>Promise.resolve(),create:()=>Promise.reject(new DOMException('NotSupportedError')),preventSilentAccess:()=>Promise.resolve()}}),configurable:true}})}}catch(e){{}}
+try{{for(const k of Object.getOwnPropertyNames(window)){{if(k.startsWith('cdc_'))try{{delete window[k]}}catch(e){{}}}}}}catch(e){{}}
+try{{window.__bl_net=0;(function(){{var f=window.fetch;if(f)window.fetch=function(){{window.__bl_net++;return f.apply(this,arguments).then(function(r){{window.__bl_net=Math.max(0,window.__bl_net-1);return r}},function(e){{window.__bl_net=Math.max(0,window.__bl_net-1);throw e}})}};var o=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(){{window.__bl_net++;var x=this;var l=function(){{x.removeEventListener('loadend',l);window.__bl_net=Math.max(0,window.__bl_net-1)}};x.addEventListener('loadend',l);return o.apply(this,arguments)}})();}}catch(e){{}}
+"""
+
+TURNSTILE_JS = r"""
+(async()=>{
+  const res={solved:false,method:'',error:'',hasToken:false,token:''};
+  const tokenInput=document.querySelector('#cf-chl-widget-3moef_response,input[name=cf-turnstile-response]');
+  if(tokenInput&&tokenInput.value&&tokenInput.value.length>5){
+    res.hasToken=true;res.token=tokenInput.value.substring(0,30);res.solved=true;res.method='already-solved';
+    return JSON.stringify(res);
+  }
+  const container=document.querySelector('[data-turnstile],.cf-turnstile,.g-recaptcha');
+  if(!container){res.error='no turnstile container';return JSON.stringify(res);}
+  let root=container.shadowRoot||container.querySelector('[data-turnstile]')?.shadowRoot;
+  if(!root){
+    const all=container.querySelectorAll('*');
+    for(const el of all){
+      if(el.shadowRoot){root=el.shadowRoot;break;}
+    }
+  }
+  if(root){
+    const cb=root.querySelector('input[type=checkbox]')||root.querySelector('[role=checkbox]')||root.querySelector('.recaptcha-checkbox');
+    if(cb){cb.click();res.solved=true;res.method='shadow-checkbox';return JSON.stringify(res);}
+    await new Promise(r=>setTimeout(r,2000));
+    const t2=document.querySelector('#cf-chl-widget-3moef_response,input[name=cf-turnstile-response]');
+    if(t2&&t2.value&&t2.value.length>10){res.solved=true;res.method='shadow-auto';res.hasToken=true;return JSON.stringify(res);}
+  }
+  const iframes=document.querySelectorAll('iframe[src*=turnstile],iframe[src*=recaptcha]');
+  if(iframes.length){
+    try{
+      const doc=iframes[0].contentDocument||iframes[0].contentWindow?.document;
+      if(doc){
+        const cb=doc.querySelector('input[type=checkbox]')||doc.querySelector('[role=checkbox]');
+        if(cb){cb.click();res.solved=true;res.method='iframe-checkbox';return JSON.stringify(res);}
+      }
+    }catch(e){}
+    const r=iframes[0].getBoundingClientRect();
+    if(r.width>0&&r.height>0){
+      const ev=new MouseEvent('click',{bubbles:true,cancelable:true,view:window,
+        clientX:r.left+r.width/2,clientY:r.top+r.height/2});
+      iframes[0].dispatchEvent(ev);
+      res.solved=true;res.method='iframe-center-click';
+      return JSON.stringify(res);
+    }
+  }
+  await new Promise(r=>setTimeout(r,3000));
+  const t3=document.querySelector('#cf-chl-widget-3moef_response,input[name=cf-turnstile-response]');
+  if(t3&&t3.value&&t3.value.length>10){res.solved=true;res.method='auto-silent';res.hasToken=true;return JSON.stringify(res);}
+  if(tokenInput&&tokenInput.value){res.solved=true;res.method='dev-mode-dummy';res.hasToken=true;res.token=tokenInput.value;return JSON.stringify(res);}
+  res.error='could not solve';
+  return JSON.stringify(res);
+})()
+"""
+
+INTERCEPT_JS = r"""
+(function(){
+  if(window.__bl_intercept_active) return;
+  window.__bl_intercept_active = true;
+  window.__bl_intercepted = [];
+  window.__bl_intercept_paused = new Set();
+  function matches(url) {
+    if(!window.__bl_intercept_pattern) return true;
+    try { return new RegExp(window.__bl_intercept_pattern).test(url); } catch(e) { return true; }
+  }
+  var _fetch = window.fetch.bind(window);
+  window.__bl_orig_fetch = _fetch;
+  window.fetch = function(url, opts){
+    if(!url) return _fetch.apply(this, arguments);
+    const u = typeof url === 'string' ? url : (url.url || url.href || '');
+    if(!matches(u)) return _fetch.apply(this, arguments);
+    const id = Date.now()+'_'+Math.random().toString(36).slice(2,8);
+    return new Promise(function(resolve, reject){
+      window.__bl_intercepted.push({id:id,url:u,method:(opts&&opts.method)||'GET',headers:(opts&&opts.headers)||{},body:(opts&&opts.body)||null,type:'fetch',_resolve:resolve,_reject:reject});
+      window.__bl_intercept_paused.add(id);
+    });
+  };
+  var _XHR = window.XMLHttpRequest;
+  function PatchedXHR(){
+    var xhr = new _XHR();
+    var meta = {url:null,method:'GET',headers:{},body:null,id:null};
+    xhr.addEventListener('readystatechange', function(){
+      if(xhr.readyState === 1 && meta.url && matches(meta.url)){
+        var id = Date.now()+'_'+Math.random().toString(36).slice(2,8);
+        meta.id = id;
+        var paused = true;
+        xhr._bl_paused = true;
+        window.__bl_intercepted.push({id:id,url:meta.url,method:meta.method,headers:meta.headers,body:meta.body,type:'xhr',_xhr:xhr,_send:function(){
+          xhr._bl_paused = false;
+          var h = meta.headers;
+          for(var k in h) try{ xhr.setRequestHeader(k,h[k]); }catch(e){}
+          xhr.open(meta.method, meta.url, true);
+          xhr.send(meta.body);
+        }});
+        window.__bl_intercept_paused.add(id);
+      }
+    });
+    var _open = xhr.open.bind(xhr);
+    xhr.open = function(m, u){
+      meta.method = m; meta.url = u;
+      _open(m, u, true);
+    };
+    var _set = xhr.setRequestHeader.bind(xhr);
+    xhr.setRequestHeader = function(k,v){
+      meta.headers[k] = v; try{ _set(k,v); }catch(e){}
+    };
+    var _send = xhr.send.bind(xhr);
+    xhr.send = function(b){
+      meta.body = b;
+      if(xhr._bl_paused) return;
+      _send(b);
+    };
+    return xhr;
+  };
+  PatchedXHR.prototype = _XHR.prototype;
+  PatchedXHR.prototype.constructor = PatchedXHR;
+  try { window.XMLHttpRequest = PatchedXHR; } catch(e) {}
+})();
+"""
+
+def cdp(ws, method, params=None, session_id=None):
+    if params is None: params = {}
+    mid = int(time.time() * 1e6) % 2**31
+    msg = {"id": mid, "method": method, "params": params}
+    if session_id: msg["sessionId"] = session_id
+    ws.send(json.dumps(msg))
+    while True:
+        raw = ws.recv()
+        data = json.loads(raw)
+        if data.get("id") == mid:
+            if "error" in data: raise Exception(json.dumps(data["error"]))
+            return data.get("result")
+
+def js_eval(ws, ses, expr):
+    r = cdp(ws, "Runtime.evaluate", {"expression": expr,"returnByValue": True,"awaitPromise": True}, session_id=ses)
+    if "exceptionDetails" in r: return {"error": r["exceptionDetails"].get("text",""),"detail": r.get("result",{}).get("description","")}
+    return r["result"].get("value")
+
+def get_session(ws, name, stealth_kw=None):
+    sessions = {}
+    if os.path.exists(SESS_FILE):
+        with open(SESS_FILE) as f: sessions = json.load(f)
+    if name in sessions:
+        tid = sessions[name]["targetId"]
+        try:
+            ra = cdp(ws, "Target.attachToTarget", {"targetId": tid, "flatten": True})
+            sessions[name]["sessionId"] = ra["sessionId"]
+            with open(SESS_FILE, "w") as f: json.dump(sessions, f)
+            return ra["sessionId"]
+        except: del sessions[name]
+    r = cdp(ws, "Target.createTarget", {"url": "about:blank", "newWindow": False})
+    tid = r["targetId"]
+    ra = cdp(ws, "Target.attachToTarget", {"targetId": tid, "flatten": True})
+    ses = ra["sessionId"]
+    sj = gen_stealth_js(**(stealth_kw or {}))
+    cdp(ws, "Page.addScriptToEvaluateOnNewDocument", {"source": sj}, session_id=ses)
+    cdp(ws, "Page.enable", session_id=ses)
+    if FP.get('tz'):
+        try: cdp(ws, "Emulation.setTimezoneOverride", {"timezoneId": FP['tz']}, session_id=ses)
+        except: pass
+    sessions[name] = {"targetId": tid, "sessionId": ses, "created": time.time()}
+    with open(SESS_FILE, "w") as f: json.dump(sessions, f)
+    return ses
+
+def inject_stealth(ws, ses):
+    js_eval(ws, ses, gen_stealth_js())
+
+def get_elements(ws, ses):
+    return js_eval(ws, ses, """JSON.stringify(Array.from(document.querySelectorAll(
+  'a,button,input,select,textarea,[tabindex],[contenteditable],'+
+  '[role=button],[role=link],[role=checkbox],[role=menuitem],[role=option]'
+)).filter(e=>e.offsetParent!==null||e===document.activeElement).slice(0,300).map((e,i)=>({
+  index:i,tag:e.tagName,type:e.type||'',id:e.id||'',text:(e.textContent||'').trim().slice(0,50),
+  cls:typeof e.className==='string'?e.className.slice(0,30):'',
+  attr:e.getAttribute('aria-label')||e.getAttribute('placeholder')||'',
+  rect:(function(r){return{x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)}}(e.getBoundingClientRect()))
+})))""")
+
+_last_mouse = {"x": 960, "y": 540}
+
+def _mouse_move_to(ws, ses, tx, ty):
+    global _last_mouse
+    sx, sy = _last_mouse["x"], _last_mouse["y"]
+    dist = ((tx - sx)**2 + (ty - sy)**2)**0.5
+    steps = max(3, min(20, int(dist / 15)))
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased = t * (2 - t)
+        x = int(sx + (tx - sx) * eased)
+        y = int(sy + (ty - sy) * eased)
+        cdp(ws, "Input.dispatchMouseEvent", {"type":"mouseMoved","x":x,"y":y}, session_id=ses)
+        time.sleep(random.uniform(0.003, 0.012))
+    _last_mouse = {"x": tx, "y": ty}
+
+def _click_coords(ws, ses, x, y, btn="left", count=1):
+    global HUMAN_MODE
+    if HUMAN_MODE:
+        _mouse_move_to(ws, ses, x, y)
+        time.sleep(random.uniform(0.02, 0.08))
+    cdp(ws, "Input.dispatchMouseEvent", {"type":"mousePressed","x":x,"y":y,"button":btn,"clickCount":count}, session_id=ses)
+    if HUMAN_MODE:
+        time.sleep(random.uniform(0.01, 0.04))
+    cdp(ws, "Input.dispatchMouseEvent", {"type":"mouseReleased","x":x,"y":y,"button":btn,"clickCount":count}, session_id=ses)
+
+def _click_index(ws, ses, idx):
+    els = json.loads(get_elements(ws, ses))
+    if not isinstance(els, list): return {"error":"no elements"}
+    if idx >= len(els): return {"error":f"index {idx} out of range (0-{len(els)-1})"}
+    e = els[idx]
+    x = e["rect"]["x"] + e["rect"]["w"]//2
+    y = e["rect"]["y"] + e["rect"]["h"]//2
+    _click_coords(ws, ses, x, y)
+    return {"clicked":idx,"tag":e["tag"],"text":e["text"][:30],"at":[x,y]}
+
+def _wait_navigation(ws, ses, timeout=10):
+    for _ in range(timeout * 2):
+        r = js_eval(ws, ses, "document.readyState")
+        if r == "complete":
+            return js_eval(ws, ses, "JSON.stringify({url:location.href,title:document.title,ready:document.readyState})")
+        time.sleep(0.5)
+    return json.dumps({"timeout":True,"readyState":r})
+
+def _detect_cf_challenge(ws, ses):
+    t = js_eval(ws, ses, "document.title")
+    if t and "Just a moment" in str(t):
+        return True
+    cf = js_eval(ws, ses, "typeof window._cf_chl_opt !== 'undefined'")
+    if cf:
+        return True
+    return False
+
+def _wait_cf_clearance(ws, ses, timeout=30):
+    for _ in range(timeout * 2):
+        try:
+            cookies = cdp(ws, "Network.getAllCookies", session_id=ses)
+            for c in cookies.get("cookies", []):
+                if c.get("name") == "cf_clearance":
+                    return True
+        except: pass
+        t = js_eval(ws, ses, "document.title")
+        if t and "Just a moment" not in str(t):
+            return True
+        time.sleep(0.5)
+    return False
+
+def _wait_network_idle(ws, ses, timeout=15, quiet=0.5):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        pending = js_eval(ws, ses, "window.__bl_net||0")
+        ready = js_eval(ws, ses, "document.readyState")
+        p = pending if isinstance(pending,(int,float)) else 1
+        if p == 0 and ready == "complete":
+            time.sleep(quiet)
+            p2 = js_eval(ws, ses, "window.__bl_net||0")
+            if isinstance(p2,(int,float)) and p2 == 0:
+                return js_eval(ws, ses, "JSON.stringify({url:location.href,title:document.title,ready:document.readyState,idle:true})")
+        time.sleep(0.3)
+    return json.dumps({"timeout":True,"pending":p,"readyState":ready})
+
+def _wait_element(ws, ses, idx, timeout=15):
+    for _ in range(timeout * 2):
+        els = json.loads(get_elements(ws, ses))
+        if isinstance(els, list) and idx < len(els):
+            return json.dumps({"found":idx,"tag":els[idx]["tag"],"text":els[idx]["text"][:30],"id":els[idx]["id"]})
+        time.sleep(0.5)
+    return json.dumps({"timeout":True,"index":idx})
+
+def _intercept(ws, ses, action, args):
+    if action == "start":
+        pat = getattr(args, 'pattern', '') or '.*'
+        js_eval(ws, ses, f"window.__bl_intercept_pattern={json.dumps(pat)}")
+        r = js_eval(ws, ses, INTERCEPT_JS)
+        if isinstance(r, dict) and r.get("error"):
+            return json.dumps({"error":r["error"]})
+        return json.dumps({"intercept":"started","pattern":pat})
+    elif action == "stop":
+        r = js_eval(ws, ses, """(function(){
+            if(!window.__bl_intercept_active) return {intercept:'already_stopped'};
+            window.__bl_intercept_active=false;
+            var _f=window.__bl_orig_fetch||window.fetch;
+            var released=0;
+            var q=window.__bl_intercepted||[];
+            for(var i=0;i<q.length;i++){
+                if(window.__bl_intercept_paused.has(q[i].id)){
+                    window.__bl_intercept_paused.delete(q[i].id);
+                    if(q[i].type==='fetch'){q[i]._resolve(_f(q[i].url,{method:q[i].method,headers:q[i].headers,body:q[i].body}));}
+                    else if(q[i].type==='xhr'&&q[i]._send){q[i]._send();}
+                    released++;
+                }
+            }
+            window.__bl_intercepted=[];
+            return {intercept:'stopped',released:released};
+        })()""")
+        return r if isinstance(r,str) else json.dumps(r)
+    elif action == "list":
+        r = js_eval(ws, ses, """JSON.stringify((window.__bl_intercepted||[]).filter(function(r){return window.__bl_intercept_paused.has(r.id)}).map(function(r,i){return{index:i,id:r.id,url:r.url,method:r.method,type:r.type,headers:r.headers,body:r.body?String(r.body).slice(0,500):null}}))""")
+        return r
+    elif action == "continue":
+        idx = int(args.idx)
+        r = js_eval(ws, ses, f"""JSON.stringify((function(){{
+            var q=window.__bl_intercepted||[];
+            var found=0;
+            for(var i=0;i<q.length;i++){{
+                if(window.__bl_intercept_paused.has(q[i].id)){{
+                    if(found===parseInt({json.dumps(idx)})){{
+                        window.__bl_intercept_paused.delete(q[i].id);
+                        if(q[i].type==='fetch'){{var _f=window.__bl_orig_fetch||window.fetch;q[i]._resolve(_f(q[i].url,{{method:q[i].method,headers:q[i].headers,body:q[i].body}}));}}
+                        else if(q[i].type==='xhr'&&q[i]._send){{q[i]._send();}}
+                        return {{intercept:'continued',id:q[i].id,url:q[i].url}};
+                    }}
+                    found++;
+                }}
+            }}
+            return {{error:'index not found'}};
+        }})())""")
+        return r if isinstance(r,str) else json.dumps(r)
+    elif action == "modify":
+        idx = int(getattr(args,'idx',0))
+        body = getattr(args,'body',None)
+        method = getattr(args,'method',None)
+        hdrs = getattr(args,'header',None) or []
+        hdr_obj = {}
+        for h in hdrs:
+            if ':' in h: k,v = h.split(':',1); hdr_obj[k.strip()] = v.strip()
+        js = """(function(){
+            var q=window.__bl_intercepted||[];
+            var found=0;
+            for(var i=0;i<q.length;i++){
+                if(window.__bl_intercept_paused.has(q[i].id)){
+                    if(found=="""+str(idx)+"""){
+                        """+(f"q[i].body={json.dumps(body)};" if body else "")+"""
+                        """+(f"q[i].method={json.dumps(method)};" if method else "")+"""
+                        """+(f"var h={json.dumps(hdr_obj)};for(var k in h)q[i].headers[k]=h[k];" if hdr_obj else "")+"""
+                        return JSON.stringify({intercept:'modified',id:q[i].id,url:q[i].url,method:q[i].method,body:String(q[i].body||'').slice(0,200)});
+                    }
+                    found++;
+                }
+            }
+            return JSON.stringify({error:'index not found'});
+        })()"""
+        r = js_eval(ws, ses, js)
+        return r if isinstance(r,str) else json.dumps(r)
+    return json.dumps({"error":"unknown action"})
+
+def _type_text(ws, ses, text, idx=None):
+    global HUMAN_MODE
+    if idx is not None:
+        els = json.loads(get_elements(ws, ses))
+        if idx >= len(els): return {"error":f"index {idx} out of range"}
+        e = els[idx]
+        x = e["rect"]["x"] + e["rect"]["w"]//2
+        y = e["rect"]["y"] + e["rect"]["h"]//2
+        _click_coords(ws, ses, x, y)
+        if HUMAN_MODE:
+            time.sleep(0.2)
+    if not HUMAN_MODE:
+        escaped = json.dumps(text)
+        js_eval(ws, ses, f"try{{const el=document.activeElement;if(el&&typeof el.value!=='undefined'){{el.value={escaped};el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}))}}}}catch(e){{}}")
+        return {"typed":text}
+    js_eval(ws, ses, "try{const el=document.activeElement;if(el&&el.tagName!=='BODY'&&typeof el.value!=='undefined'){el.value='';el.focus();el.dispatchEvent(new Event('focus',{bubbles:true}))}}catch(e){}")
+    time.sleep(0.1)
+    for char in text:
+        if char == '\n':
+            cdp(ws, "Input.dispatchKeyEvent",{"type":"rawKeyDown","key":"Enter","windowsVirtualKeyCode":13},session_id=ses)
+            cdp(ws, "Input.dispatchKeyEvent",{"type":"keyUp","key":"Enter","windowsVirtualKeyCode":13},session_id=ses)
+        else:
+            cdp(ws, "Input.dispatchKeyEvent",{"type":"keyDown","key":char,"windowsVirtualKeyCode":ord(char)},session_id=ses)
+            cdp(ws, "Input.dispatchKeyEvent",{"type":"char","key":char,"windowsVirtualKeyCode":ord(char),"text":char,"unmodifiedText":char},session_id=ses)
+            cdp(ws, "Input.dispatchKeyEvent",{"type":"keyUp","key":char,"windowsVirtualKeyCode":ord(char)},session_id=ses)
+        time.sleep(random.uniform(0.03, 0.08))
+    return {"typed":text}
+
+def _scroll(ws, ses, direction="down", amount=300):
+    sign = 1 if direction == "down" else -1
+    js_eval(ws, ses, f"window.scrollBy(0,{sign*amount})")
+    return {"scrolled":direction,"amount":amount}
+
+def cmd_start(args):
+    if os.path.exists(DATA_DIR):
+        for _ in range(10):
+            try: shutil.rmtree(DATA_DIR); break
+            except: time.sleep(0.5)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    port = args.port or 0
+    w = args.width or 0
+    h = args.height or 0
+    if not w or not h:
+        sz = random.choice(_COMMON_SIZES)
+        if not w: w = sz[0]
+        if not h: h = sz[1]
+    locale = args.locale or 'en-US'
+    ua = f'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{BVER}.0.0.0 Safari/537.36'
+    cmd = [
+        BROWSER, f"--remote-debugging-port={port}",
+        "--headless=new" if not args.headed else "",
+        "--no-sandbox",
+        f"--window-size={w},{h}",
+        f"--lang={locale[:5]}",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-sync","--disable-extensions",
+        "--disable-background-networking","--disable-default-apps",
+        "--disable-translate","--mute-audio","--no-first-run",
+        "--disable-features=ChromeWhatsNewUI,TranslateUI",
+        "--remote-allow-origins=*",
+        f"--ozone-override-screen-size={w},{h}",
+        f'--user-agent={ua}',
+        f"--user-data-dir={DATA_DIR}",
+        "about:blank"
+    ]
+    if args.proxy_server:
+        cmd.insert(4, f"--proxy-server={args.proxy_server}")
+    if args.tz:
+        cmd.insert(4, f"--timezone={args.tz}")
+    if args.profile:
+        pdir = os.path.expanduser(f"~/.config/chromium/{args.profile}")
+        cmd[cmd.index(f"--user-data-dir={DATA_DIR}")] = f"--user-data-dir={pdir}"
+    cmd = [c for c in cmd if c]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+    port = None; t0 = time.time()
+    while time.time() - t0 < 10:
+        line = proc.stderr.readline().decode("utf-8",errors="replace")
+        m = re.search(r"ws://[^\s]+:(\d+)",line)
+        if m: port = int(m.group(1)); break
+    if not port: print("ERROR: cannot find CDP port",file=sys.stderr); proc.kill(); sys.exit(1)
+    ws_url = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version").read())["webSocketDebuggerUrl"]
+    with open(PID_FILE,"w") as f: json.dump({"pid":proc.pid,"ppid":os.getpid(),"cdp_url":ws_url,"port":port,"w":w,"h":h,"tz":args.tz,"locale":locale},f)
+    if args.json: print(json.dumps({"cdp_url":ws_url,"pid":proc.pid,"port":port}))
+    else: print(ws_url)
+    print(f"[browser-local] PID={proc.pid} port={port} headed={args.headed}",file=sys.stderr); sys.stdout.flush()
+    signal.signal(signal.SIGTERM, lambda s,f: sys.exit(0))
+    try:
+        while True: time.sleep(60)
+    except KeyboardInterrupt: os.kill(proc.pid,signal.SIGTERM); proc.wait(); sys.exit(0)
+
+def cmd_with_session(ws, args, ses):
+    inject_stealth(ws, ses)
+    out = None
+    blk = []
+    if getattr(args,'block_images',False): blk.extend(["*.jpg","*.jpeg","*.png","*.gif","*.webp","*.svg","*.ico","*.avif","*.bmp","*.tiff","*.webp"])
+    if getattr(args,'block_css',False): blk.append("*.css")
+    if getattr(args,'block_fonts',False): blk.extend(["*.woff","*.woff2","*.ttf","*.otf","*.eot"])
+    if blk or getattr(args,'wait_cf',False):
+        if not blk:
+            cdp(ws, "Network.enable", session_id=ses)
+        else:
+            cdp(ws, "Network.enable", session_id=ses)
+            cdp(ws, "Network.setBlockedURLs", {"urls": blk}, session_id=ses)
+    if args.command == "open":
+        cdp(ws, "Page.navigate",{"url":args.url},session_id=ses)
+        time.sleep(1.5)
+        if getattr(args,'wait_cf',False):
+            if _detect_cf_challenge(ws, ses):
+                timeout = getattr(args,'cf_timeout',30)
+                cleared = _wait_cf_clearance(ws, ses, timeout)
+                if cleared:
+                    time.sleep(1)
+                    cdp(ws, "Page.navigate",{"url":args.url},session_id=ses)
+                    for _ in range(20):
+                        r = js_eval(ws, ses, "document.readyState")
+                        if r == "complete": break
+                        time.sleep(0.5)
+                else:
+                    solve_r = js_eval(ws, ses, TURNSTILE_JS)
+                    time.sleep(2)
+                    cleared2 = _wait_cf_clearance(ws, ses, timeout//2)
+                    if cleared2:
+                        time.sleep(1)
+                        cdp(ws, "Page.navigate",{"url":args.url},session_id=ses)
+                        for _ in range(20):
+                            r = js_eval(ws, ses, "document.readyState")
+                            if r == "complete": break
+                            time.sleep(0.5)
+                    else:
+                        out = json.dumps({"error":"cf_challenge_timeout","url":args.url,"solve":solve_r})
+        if not out:
+            out = js_eval(ws, ses, "JSON.stringify({url:location.href,title:document.title,ready:document.readyState})")
+    elif args.command == "eval":
+        out = js_eval(ws, ses, args.js)
+    elif args.command == "screenshot":
+        params = {"format":"png","fromSurface":True}
+        if getattr(args,'full',False): params["captureBeyondViewport"]=True
+        r = cdp(ws, "Page.captureScreenshot",params,session_id=ses)
+        data = base64.b64decode(r["data"])
+        if args.path:
+            with open(args.path,"wb") as f: f.write(data)
+            out = json.dumps({"saved":args.path}) if args.json else f"saved {args.path}"
+        elif args.json: out = base64.b64encode(data).decode()
+        else: out = r["data"]
+    elif args.command == "state":
+        out = js_eval(ws, ses, "JSON.stringify({url:location.href,title:document.title,ready:document.readyState})")
+    elif args.command == "elements":
+        out = get_elements(ws, ses)
+    elif args.command == "click":
+        if len(args.args)==1: out = json.dumps(_click_index(ws,ses,int(args.args[0])))
+        elif len(args.args)==2:
+            _click_coords(ws,ses,int(args.args[0]),int(args.args[1]))
+            out = json.dumps({"clicked":[int(args.args[0]),int(args.args[1])]})
+        if getattr(args,'wait_nav',False) and out:
+            nav = _wait_navigation(ws, ses)
+            out = f"{out}\n{nav}"
+        if getattr(args,'wait_idle',False) and out:
+            idle = _wait_network_idle(ws, ses)
+            out = f"{out}\n{idle}"
+    elif args.command == "type":
+        out = json.dumps(_type_text(ws,ses,args.text))
+    elif args.command == "input":
+        out = json.dumps(_type_text(ws,ses,args.text,int(args.index)))
+    elif args.command == "scroll":
+        out = json.dumps(_scroll(ws,ses,args.direction or "down",args.amount or 300))
+    elif args.command == "back":
+        js_eval(ws, ses, "history.back()")
+        time.sleep(1.5)
+        out = js_eval(ws, ses, "JSON.stringify({url:location.href,title:document.title,ready:document.readyState})")
+    elif args.command == "tab" and getattr(args,'action',None)=="list":
+        r = cdp(ws, "Target.getTargets")
+        tabs = [t for t in r.get("targetInfos",[]) if t["type"]=="page"]
+        out = json.dumps([{"id":t["targetId"][:8],"title":t["title"][:40],"url":t["url"][:60]} for t in tabs])
+    elif args.command == "tab" and getattr(args,'action',None)=="new":
+        r = cdp(ws, "Target.createTarget",{"url":"about:blank","newWindow":False})
+        out = json.dumps({"targetId":r["targetId"]})
+    elif args.command == "keys":
+        key_map = {"enter":"Enter","tab":"Tab","escape":"Escape","backspace":"Backspace",
+                   "delete":"Delete","arrowup":"ArrowUp","arrowdown":"ArrowDown",
+                   "arrowleft":"ArrowLeft","arrowright":"ArrowRight","space":" "}
+        k = args.keys
+        if k.lower() in key_map: k = key_map[k.lower()]
+        modifiers = 0
+        if k.startswith("Control+") or k.startswith("Ctrl+"):
+            modifiers = 2; k = k.split("+",1)[1]
+        cdp(ws, "Input.dispatchKeyEvent",{"type":"keyDown","key":k,"windowsVirtualKeyCode":ord(k[0]) if len(k)==1 else 0,"modifiers":modifiers},session_id=ses)
+        cdp(ws, "Input.dispatchKeyEvent",{"type":"keyUp","key":k,"modifiers":modifiers},session_id=ses)
+        out = json.dumps({"key":args.keys})
+    elif args.command in ("hover","dblclick","rightclick"):
+        idx = int(args.index)
+        els = json.loads(get_elements(ws, ses))
+        if idx < len(els):
+            e = els[idx]; x = e["rect"]["x"]+e["rect"]["w"]//2; y = e["rect"]["y"]+e["rect"]["h"]//2
+            btn = {"hover":"none","dblclick":"left","rightclick":"right"}[args.command]
+            count = {"hover":1,"dblclick":2,"rightclick":1}[args.command]
+            if HUMAN_MODE:
+                _mouse_move_to(ws, ses, x, y)
+            if args.command != "hover":
+                if HUMAN_MODE:
+                    time.sleep(random.uniform(0.02, 0.08))
+                cdp(ws, "Input.dispatchMouseEvent",{"type":"mousePressed","x":x,"y":y,"button":btn,"clickCount":count},session_id=ses)
+                if HUMAN_MODE:
+                    time.sleep(random.uniform(0.01, 0.04))
+                cdp(ws, "Input.dispatchMouseEvent",{"type":"mouseReleased","x":x,"y":y,"button":btn,"clickCount":count},session_id=ses)
+            out = json.dumps({args.command:idx,"at":[x,y]})
+        else: out = json.dumps({"error":f"index {idx} not found"})
+    elif args.command == "select":
+        idx = int(args.index)
+        els = json.loads(get_elements(ws, ses))
+        if idx < len(els):
+            e = els[idx]; x = e["rect"]["x"]+e["rect"]["w"]//2; y = e["rect"]["y"]+e["rect"]["h"]//2
+            _click_coords(ws,ses,x,y)
+            js_eval(ws, ses, f"const el=document.activeElement;if(el&&el.tagName==='SELECT'){{el.value={json.dumps(args.value)};el.dispatchEvent(new Event('change',{{bubbles:true}}))}}")
+            out = json.dumps({"selected":args.value})
+        else: out = json.dumps({"error":f"index {idx} not found"})
+    elif args.command == "upload":
+        idx = int(args.index)
+        els = json.loads(get_elements(ws, ses))
+        if idx < len(els) and os.path.exists(args.path):
+            fp = os.path.abspath(args.path)
+            cdp(ws, "DOM.setFileInputFiles",{"files":[fp],"nodeId":0},session_id=ses)
+            js_eval(ws, ses, f"const el=document.querySelector('input[type=file]');if(el){{const dt=new DataTransfer();const f=new File([''],{json.dumps(os.path.basename(fp))});Object.defineProperty(dt,'files',{{value:[f]}});el.files=dt.files;el.dispatchEvent(new Event('change',{{bubbles:true}}))}}")
+            out = json.dumps({"uploaded":fp})
+        else: out = json.dumps({"error":"file not found or index out of range"})
+    elif args.command == "intercept":
+        act = getattr(args,'action',None)
+        if act: out = _intercept(ws, ses, act, args)
+    elif args.command == "wait":
+        wat = getattr(args,'what',None)
+        val = getattr(args,'value',None)
+        to = getattr(args,'timeout',None) or 15
+        if wat == "navigation":
+            out = _wait_navigation(ws, ses, to)
+        elif wat == "networkidle":
+            out = _wait_network_idle(ws, ses, to, getattr(args,'quiet',0.5))
+        elif wat == "element":
+            out = _wait_element(ws, ses, int(val), to)
+        else:
+            for _ in range(to * 2):
+                if wat == "selector":
+                    r = js_eval(ws, ses, f"document.querySelector({json.dumps(val)})!==null")
+                elif wat == "text":
+                    r = js_eval(ws, ses, f"document.body.innerText.includes({json.dumps(val)})")
+                if r: out = json.dumps({"found":val}); break
+                time.sleep(0.5)
+            if not out: out = json.dumps({"timeout":val})
+    elif args.command == "cookies":
+        if getattr(args,'action',None) == "get":
+            r = cdp(ws,"Network.getAllCookies",session_id=ses)
+            out = json.dumps(r.get("cookies",[]),indent=2)
+        elif getattr(args,'action',None) == "clear":
+            cdp(ws,"Network.clearBrowserCookies",session_id=ses); out = "cookies cleared"
+    elif args.command == "solve":
+        r = js_eval(ws, ses, TURNSTILE_JS)
+        out = r if isinstance(r,str) else json.dumps(r)
+        time.sleep(2)
+        url = js_eval(ws, ses, "location.href")
+        title = js_eval(ws, ses, "document.title")
+        out2 = js_eval(ws, ses, "JSON.stringify({url:location.href,title:document.title,ready:document.readyState})")
+        out = f"{out}\n{out2}"
+    print(out if out else "ok")
+
+def main():
+    p = argparse.ArgumentParser(prog="browser-local",description="Chromium CDP automation (browser-use compatible, no cloud)")
+    p.add_argument("--cdp-url")
+    p.add_argument("--session", default="default")
+    p.add_argument("--headed", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--human", action="store_true")
+    p.add_argument("--block-images", action="store_true")
+    p.add_argument("--block-css", action="store_true")
+    p.add_argument("--block-fonts", action="store_true")
+    sub = p.add_subparsers(dest="command")
+    sp = sub.add_parser("start", help="Launch Chromium browser")
+    sp.add_argument("--port", type=int, default=0)
+    sp.add_argument("--width", type=int, default=0)
+    sp.add_argument("--height", type=int, default=0)
+    sp.add_argument("--profile")
+    sp.add_argument("--proxy-server")
+    sp.add_argument("--tz", default="")
+    sp.add_argument("--locale", default="")
+    sp = sub.add_parser("open", help="Navigate to URL")
+    sp.add_argument("url")
+    sp.add_argument("--wait-cf", action="store_true")
+    sp.add_argument("--cf-timeout", type=int, default=30)
+    sub.add_parser("eval", help="Execute JavaScript").add_argument("js")
+    sp = sub.add_parser("screenshot", help="Take screenshot")
+    sp.add_argument("path", nargs="?")
+    sp.add_argument("--full", action="store_true")
+    sub.add_parser("state", help="Get browser state")
+    sub.add_parser("elements", help="List interactive elements")
+    sp = sub.add_parser("click", help="Click element by index or x y")
+    sp.add_argument("args", nargs="+")
+    sp.add_argument("--wait-nav", action="store_true")
+    sp.add_argument("--wait-idle", action="store_true")
+    sub.add_parser("type", help="Type into active element").add_argument("text")
+    sp = sub.add_parser("input", help="Type into element by index")
+    sp.add_argument("index")
+    sp.add_argument("text")
+    sp = sub.add_parser("scroll", help="Scroll page")
+    sp.add_argument("direction", nargs="?", choices=["up","down"], default="down")
+    sp.add_argument("--amount", type=int, default=300)
+    sub.add_parser("back", help="Go back")
+    sp = sub.add_parser("tab", help="Tab management")
+    ta = sp.add_subparsers(dest="action")
+    ta.add_parser("list")
+    ta.add_parser("new")
+    sub.add_parser("keys", help="Send keyboard keys").add_argument("keys")
+    for cmd in ["hover","dblclick","rightclick"]:
+        sub.add_parser(cmd, help=f"{cmd} element by index").add_argument("index")
+    sp = sub.add_parser("select", help="Select dropdown option")
+    sp.add_argument("index")
+    sp.add_argument("value")
+    sp = sub.add_parser("upload", help="Upload file")
+    sp.add_argument("index")
+    sp.add_argument("path")
+    sp = sub.add_parser("wait", help="Wait for condition")
+    wa = sp.add_subparsers(dest="what")
+    wsp = wa.add_parser("selector"); wsp.add_argument("value"); wsp.add_argument("--timeout", type=int, default=15)
+    wtp = wa.add_parser("text"); wtp.add_argument("value"); wtp.add_argument("--timeout", type=int, default=15)
+    wnp = wa.add_parser("navigation"); wnp.add_argument("--timeout", type=int, default=10)
+    wip = wa.add_parser("networkidle"); wip.add_argument("--timeout", type=int, default=15); wip.add_argument("--quiet", type=float, default=0.5)
+    wep = wa.add_parser("element"); wep.add_argument("value"); wep.add_argument("--timeout", type=int, default=15)
+    sp = sub.add_parser("intercept", help="Network interceptor")
+    ia = sp.add_subparsers(dest="action")
+    isp = ia.add_parser("start"); isp.add_argument("--pattern", default=".*")
+    ia.add_parser("stop")
+    ia.add_parser("list")
+    icp = ia.add_parser("continue"); icp.add_argument("idx")
+    imp = ia.add_parser("modify"); imp.add_argument("idx"); imp.add_argument("--body"); imp.add_argument("--method"); imp.add_argument("--header", action="append")
+    sp = sub.add_parser("cookies", help="Cookie operations")
+    ca = sp.add_subparsers(dest="action")
+    ca.add_parser("get"); ca.add_parser("clear")
+    sub.add_parser("solve", help="Solve Turnstile")
+    sub.add_parser("close", help="Close browser")
+    sub.add_parser("sessions", help="List active sessions")
+    sub.add_parser("init", help="Generate config template")
+    sub.add_parser("install", help="Check Chromium")
+    sub.add_parser("doctor", help="Check dependencies")
+    sub.add_parser("connect", help="Connect to browser").add_argument("--cdp-url")
+
+    args = p.parse_args()
+    global HUMAN_MODE
+    HUMAN_MODE = args.human
+    if not args.command: p.print_help(); sys.exit(1)
+
+    if args.command == "start": cmd_start(args); return
+    if args.command == "close":
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                d = json.load(f)
+                ppid = d.get("ppid")
+            if ppid:
+                try: os.kill(ppid, signal.SIGTERM)
+                except: pass
+            try:
+                for e in os.listdir("/proc"):
+                    if e.isdigit():
+                        try:
+                            with open(f"/proc/{e}/cmdline","rb") as cf:
+                                if DATA_DIR.encode() in cf.read():
+                                    p = int(e)
+                                    if p != os.getpid(): os.kill(p, signal.SIGKILL)
+                        except: pass
+            except: pass
+            time.sleep(2)
+        for f in [PID_FILE,SESS_FILE]:
+            if os.path.exists(f): os.remove(f)
+        if os.path.exists(DATA_DIR):
+            for _ in range(15):
+                try: shutil.rmtree(DATA_DIR); break
+                except: time.sleep(0.5)
+        print("closed"); return
+    if args.command == "sessions":
+        if os.path.exists(SESS_FILE):
+            with open(SESS_FILE) as f: s = json.load(f)
+            print(json.dumps(s,indent=2) if args.json else json.dumps({k:{"created":time.ctime(v.get("created",0)),"targetId":v["targetId"][:12]+"..."} for k,v in s.items()},indent=2))
+        else: print("no sessions"); return
+    if args.command == "init": print("# browser-local config"); return
+    if args.command == "install":
+        if os.path.exists(BROWSER): print(f"Chromium found: {BROWSER}"); sys.exit(0)
+        else: print(f"Chromium not found: {BROWSER}"); sys.exit(1)
+    if args.command == "doctor":
+        deps = {BROWSER: os.path.exists(BROWSER), "python3-websocket": True}
+        for d, ok in deps.items(): print(f"{'OK' if ok else 'MISSING'}: {d}")
+        sys.exit(0 if all(deps.values()) else 1)
+    if args.command == "config": print("config: use env or CLI flags"); return
+    if args.command == "connect":
+        print("connected"); return
+
+    if not args.cdp_url:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f: args.cdp_url = json.load(f)["cdp_url"]
+        else:
+            print("ERROR: no --cdp-url and no running browser", file=sys.stderr); sys.exit(1)
+
+    ws = create_connection(args.cdp_url, timeout=30)
+    try:
+        ses = get_session(ws, args.session)
+        cmd_with_session(ws, args, ses)
+    finally:
+        ws.close()
+
+if __name__ == "__main__":
+    main()
